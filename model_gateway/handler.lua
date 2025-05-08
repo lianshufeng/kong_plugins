@@ -1,117 +1,123 @@
--- If you're not sure your plugin is executing, uncomment the line below and restart Kong
--- then it will throw an error which indicates the plugin is being loaded at least.
-
---assert(ngx.get_phase() == "timer", "The world is coming to an end!")
-
----------------------------------------------------------------------------------------------
--- In the code below, just remove the opening brackets; `[[` to enable a specific handler
---
--- The handlers are based on the OpenResty handlers, see the OpenResty docs for details
--- on when exactly they are invoked and what limitations each handler has.
----------------------------------------------------------------------------------------------
-
-
+local cjson = require "cjson.safe"
 
 local plugin = {
-  PRIORITY = 1000, -- set the plugin priority, which determines plugin execution order
-  VERSION = "0.1", -- version in X.Y.Z format. Check hybrid-mode compatibility requirements.
+  PRIORITY = 1000,
+  VERSION = "0.1",
 }
 
+local service_cache = {}
 
+local function update_service_cache(new_data)
+  for k in pairs(service_cache) do
+    service_cache[k] = nil
+  end
+  for k, v in pairs(new_data) do
+    service_cache[k] = v
+  end
+end
 
--- do initialization here, any module level code runs in the 'init_by_lua_block',
--- before worker processes are forked. So anything you add here will run once,
--- but be available in all workers.
-
-
-
--- handles more initialization, but AFTER the worker process has been forked/created.
--- It runs in the 'init_worker_by_lua_block'
 function plugin:init_worker()
+  kong.log.notice("init_worker: starting service cache timer")
 
-  -- your custom code here
-  kong.log.debug("saying hi from the 'init_worker' handler")
+  local function fetch_services(premature)
+    if premature then return end
 
-end --]]
+    kong.log.debug("Fetching services from kong.db")
 
+    local services, err = kong.db.services:each()
+    if err then
+      kong.log.err("Failed to fetch services: ", err)
+      return
+    end
 
----[[ Executed every time a plugin config changes.
--- This can run in the `init_worker` or `timer` phase.
--- @param configs table|nil A table with all the plugin configs of this plugin type.
-function plugin:configure(configs)
-  kong.log.notice("saying hi from the 'configure' handler, got ", (configs and #configs or 0)," configs")
+    local new_cache = {}
+    local count = 0
+    for svc, err in services do
+      if not err then
+        new_cache[svc.name] = {
+          host = svc.host,
+          port = svc.port,
+          path = svc.path,
+          protocol = svc.protocol or "http", -- 缓存协议用于日志
+        }
+        count = count + 1
+        kong.log.debug("Cached service: ", svc.name, " -> ", svc.host, ":", svc.port, svc.path or "", " (", svc.protocol, ")")
+      end
+    end
 
-  if configs == nil then
-    return -- no configs, nothing to do
+    update_service_cache(new_cache)
+    kong.log.debug("Service cache updated with ", count, " entries")
   end
 
-  -- your custom code here
+  local ok, err = ngx.timer.every(10, fetch_services)
+  if not ok then
+    kong.log.err("Failed to start service fetch timer: ", err)
+  end
+end
 
-end --]]
+function plugin:configure(configs)
+  kong.log.notice("configure handler: got ", (configs and #configs or 0), " configs")
+end
 
-
---[[ runs in the 'ssl_certificate_by_lua_block'
--- IMPORTANT: during the `certificate` phase neither `route`, `service`, nor `consumer`
--- will have been identified, hence this handler will only be executed if the plugin is
--- configured as a global plugin!
-function plugin:certificate(plugin_conf)
-
-  -- your custom code here
-  kong.log.debug("saying hi from the 'certificate' handler")
-
-end --]]
-
-
-
---[[ runs in the 'rewrite_by_lua_block'
--- IMPORTANT: during the `rewrite` phase neither `route`, `service`, nor `consumer`
--- will have been identified, hence this handler will only be executed if the plugin is
--- configured as a global plugin!
-function plugin:rewrite(plugin_conf)
-
-  -- your custom code here
-  kong.log.debug("saying hi from the 'rewrite' handler")
-
-end --]]
-
-
-
--- runs in the 'access_by_lua_block'
 function plugin:access(plugin_conf)
+  -- 只在路由名匹配时生效
+  local route = kong.router.get_route()
+  if not route or route.name ~= plugin_conf.route_name then
+    kong.log.debug("Skipping plugin: route name mismatch")
+    return
+  end
 
-  -- your custom code here
-  kong.log.inspect(plugin_conf)   -- check the logs for a pretty-printed config!
-  kong.service.request.set_header(plugin_conf.request_header, "this is on a request")
+  local method = kong.request.get_method()
+  if method ~= "POST" then
+    return
+  end
 
-end --]]
+  local body = kong.request.get_raw_body()
+  if not body then
+    return
+  end
+
+  local json, err = cjson.decode(body)
+  if not json then
+    return
+  end
+
+  local model = json.model
+  if not model then
+    return
+  end
+
+  local service_name = plugin_conf.service_prefix .. model
+
+  local svc = service_cache[service_name]
+  if not svc then
+    kong.log.notice("No matching service found in cache for model: ", model)
+    return
+  end
+
+  kong.log.notice("Routing to service: ", service_name, " -> ", svc.host, ":", svc.port, " (", svc.protocol, ")")
+  kong.service.set_target(svc.host, svc.port)
+
+  -- 设置协议：默认是 http，只有显式指定为 https 才设置为 https
+  -- if svc.protocol == "https" then
+    -- kong.log.debug("Setting upstream protocol to HTTPS")
+    -- kong.service.set_protocol("https")
+  -- else
+    -- kong.log.debug("Using default upstream protocol (HTTP)")
+    -- kong.service.set_protocol("http")
+  -- end
+
+  if svc.path then
+    kong.log.notice("Setting request path to: ", svc.path)
+    kong.service.request.set_path(svc.path)
+  end
+
+  ngx.ctx.buffered = false
+end
 
 
--- runs in the 'header_filter_by_lua_block'
 function plugin:header_filter(plugin_conf)
+  kong.response.set_header("X-Model-Routed", "true")
+end
 
-  -- your custom code here, for example;
-  kong.response.set_header(plugin_conf.response_header, "this is on the response")
-
-end --]]
-
-
---[[ runs in the 'body_filter_by_lua_block'
-function plugin:body_filter(plugin_conf)
-
-  -- your custom code here
-  kong.log.debug("saying hi from the 'body_filter' handler")
-
-end --]]
-
-
---[[ runs in the 'log_by_lua_block'
-function plugin:log(plugin_conf)
-
-  -- your custom code here
-  kong.log.debug("saying hi from the 'log' handler")
-
-end --]]
-
-
--- return our plugin object
 return plugin

@@ -26,6 +26,14 @@ local schema = {
             }
           },
 
+          -- 路由名称，默认值为 "model_api"
+          { route_name = {
+              type = "string",
+              required = true,
+              default = "model_api",
+            }
+          },
+
           -- 模型与 API Key 的映射关系数组，每一项包含 model 和 apikey 两个字符串字段
           { model_apikey_map = {
               type = "array",
