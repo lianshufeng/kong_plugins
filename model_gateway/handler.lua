@@ -110,7 +110,7 @@ function plugin:access(plugin_conf)
   
   
   -- 查找 apikey 并设置 Authorization 头
-  kong.service.request.set_header("Authorization","") -- 清空调，防止参数穿
+  -- kong.service.request.set_header("Authorization","") -- 清空调，防止参数穿
   for _, entry in ipairs(plugin_conf.model_apikey_map or {}) do
     if entry.model == model then
       local token = "Bearer " .. entry.apikey
