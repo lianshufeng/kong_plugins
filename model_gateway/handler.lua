@@ -74,7 +74,7 @@ function plugin:access(plugin_conf)
     return
   end
 
-  ngx.req.read_body()  -- 确保可以读取请求体
+  ngx.req.read_body()
   local body = kong.request.get_raw_body()
 
   if not body then
@@ -128,9 +128,22 @@ function plugin:access(plugin_conf)
   for _, entry in ipairs(plugin_conf.model_apikey_map or {}) do
     kong.log.debug("遍历 apikey 映射: 模型=", entry.model, ", key=", entry.apikey)
     if entry.model == model then
-      local token = "Bearer " .. entry.apikey
-      kong.service.request.set_header("Authorization", token)
-      kong.log.debug("设置 Authorization 头: ", token)
+      -- 设置 Authorization 头
+      if entry.apikey then
+        local token = "Bearer " .. entry.apikey
+        kong.service.request.set_header("Authorization", token)
+        kong.log.debug("设置 Authorization 头: ", token)
+      end
+
+      -- 替换请求体中的模型名（仅限于请求体）
+      if entry.newmodel then
+        kong.log.debug("替换模型名（仅请求体）: ", model, " -> ", entry.newmodel)
+        json.model = entry.newmodel
+        local new_body = cjson.encode(json)
+        kong.service.request.set_raw_body(new_body)
+        kong.log.debug("已更新请求体: ", new_body)
+      end
+
       break
     end
   end
@@ -138,6 +151,7 @@ function plugin:access(plugin_conf)
   kong.log.notice("将请求路由到服务: ", service_name, " -> ", svc.host, ":", svc.port, " (", svc.protocol, "), 路径: ", svc.path or "/")
   ngx.ctx.buffered = false
 end
+
 
 function plugin:header_filter(plugin_conf)
   kong.response.set_header("X-Model-Routed", "true")

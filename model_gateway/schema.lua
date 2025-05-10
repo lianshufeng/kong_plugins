@@ -43,7 +43,8 @@ local schema = {
                 type = "record",
                 fields = {
                   { model = { type = "string", required = true } },  -- 模型名称
-                  { apikey = { type = "string", required = true } }, -- 对应 API Key
+                  { apikey = { type = "string", required = false } }, -- 对应 API Key
+				  { newmodel = { type = "string", required = false } }, -- 需更换的新模型
                 }
               }
             }
