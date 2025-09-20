@@ -1,40 +1,131 @@
-local cjson = require "cjson.safe"
+-- kong/plugins/yourplugin/handler.lua
+-- 功能：根据请求体中的 model，路由到对应 Service，并按 model 映射选择 apikey（支持 ","/";" 分隔，优先轮询，异常随机）
+
+local cjson_safe = require "cjson.safe"
+
+-- ================== 常量与别名 ==================
+local kong = kong
+local ngx  = ngx
+local encode = cjson_safe.encode
+local decode = cjson_safe.decode
 
 local plugin = {
   PRIORITY = 1000,
-  VERSION = "0.1",
+  VERSION  = "0.1",
 }
 
-local service_cache = {}
+-- ================== 内部状态 ==================
+local service_cache = {}   -- name -> {host, port, path, protocol}
+local rr_state = {}        -- 轮询状态：model -> next index
 
-local function update_service_cache(new_data)
-  kong.log.debug("更新服务缓存: ", cjson.encode(new_data))
-  service_cache = new_data
+-- ================== 工具函数 ==================
+local function jlog(val)
+  return encode(val) or "<unencodable>"
 end
 
+local function trim(s)
+  return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- 支持 "," 或 ";" 分隔；若 apikey 已是数组也兼容
+local function normalize_apikeys(apikey_field)
+  if not apikey_field then return {} end
+
+  if type(apikey_field) == "table" then
+    local t = {}
+    for _, v in ipairs(apikey_field) do
+      if v and v ~= "" then t[#t+1] = trim(v) end
+    end
+    return t
+  end
+
+  if type(apikey_field) == "string" then
+    local arr = {}
+    for token in apikey_field:gmatch("[^,;]+") do
+      local v = trim(token)
+      if v ~= "" then arr[#arr+1] = v end
+    end
+    return arr
+  end
+
+  return {}
+end
+
+local function rr_pick(model, keys)
+  if #keys == 0 then return nil end
+  local i = rr_state[model]
+  if not i or i < 1 or i > #keys then i = 1 end
+  local chosen = keys[i]
+  i = i + 1
+  if i > #keys then i = 1 end
+  rr_state[model] = i
+  return chosen
+end
+
+local function rand_pick(keys)
+  if #keys == 0 then return nil end
+  return keys[math.random(1, #keys)]
+end
+
+-- 读取请求体（优先内存；不在内存则尝试磁盘）
+local function read_raw_body()
+  ngx.req.read_body()
+  local body = kong.request.get_raw_body()
+  if body then return body end
+
+  local file_path = ngx.req.get_body_file()
+  if not file_path then
+    kong.log.warn("请求体不在内存且无磁盘文件")
+    return nil
+  end
+
+  local f, err = io.open(file_path, "rb")
+  if not f then
+    kong.log.err("打开请求体文件失败: ", err)
+    return nil
+  end
+
+  local data = f:read("*a")
+  f:close()
+  return data
+end
+
+local function set_upstream_target(svc)
+  kong.service.set_target(svc.host, svc.port)
+  kong.service.request.set_scheme(svc.protocol or "http")
+  if svc.path then
+    kong.service.request.set_path(svc.path)
+  end
+end
+
+local function update_service_cache(new_tbl)
+  kong.log.debug("更新服务缓存: ", jlog(new_tbl))
+  service_cache = new_tbl
+end
+
+-- ================== 生命周期：定时拉取服务 ==================
 function plugin:init_worker()
   kong.log.notice("init_worker: 启动服务缓存定时器")
+
+  -- 随机数种子（用于随机兜底更均匀）
+  math.randomseed(ngx.now() * 1000 + ngx.worker.pid())
 
   local function fetch_services(premature)
     if premature then return end
 
-    kong.log.debug("从 kong.db 拉取服务信息")
-
-    local services, err = kong.db.services:each()
+    local iter, err = kong.db.services:each()
     if err then
       kong.log.err("获取服务失败: ", err)
       return
     end
 
-    local new_cache = {}
-    local count = 0
-
-    for svc, err in services do
-      if not err then
+    local new_cache, count = {}, 0
+    for svc, iter_err in iter do
+      if not iter_err then
         new_cache[svc.name] = {
-          host = svc.host,
-          port = svc.port,
-          path = svc.path,
+          host     = svc.host,
+          port     = svc.port,
+          path     = svc.path,
           protocol = svc.protocol or "http",
         }
         count = count + 1
@@ -46,9 +137,10 @@ function plugin:init_worker()
     kong.log.debug("服务缓存更新完成，共 ", count, " 个服务")
   end
 
-  kong.log.notice("init_worker: 立即执行一次服务拉取")
+  -- 启动即拉一次
   fetch_services(false)
 
+  -- 每 30s 更新一次
   local ok, err = ngx.timer.every(30, fetch_services)
   if not ok then
     kong.log.err("启动服务拉取定时器失败: ", err)
@@ -56,104 +148,99 @@ function plugin:init_worker()
 end
 
 function plugin:configure(configs)
-  kong.log.notice("configure handler: 收到 ", (configs and #configs or 0), " 个配置项")
+  kong.log.notice("configure: 收到配置项数量 = ", (configs and #configs or 0))
 end
 
-function plugin:access(plugin_conf)
+-- ================== 主流程 ==================
+function plugin:access(conf)
+  -- 路由匹配（早返回）
   local route = kong.router.get_route()
-  kong.log.debug("当前路由: ", route and route.name or "nil")
-  kong.log.debug("配置期望路由: ", plugin_conf.route_name)
-  if not route or route.name ~= plugin_conf.route_name then
-    kong.log.debug("跳过插件: 路由名称不匹配")
+  local route_name = route and route.name or nil
+  if route_name ~= conf.route_name then
+    kong.log.debug("跳过：路由名称不匹配。当前=", route_name or "nil", " 期望=", conf.route_name or "nil")
     return
   end
 
-  local method = kong.request.get_method()
-  kong.log.debug("请求方法: ", method)
-  if method ~= "POST" then
+  -- 仅处理 POST
+  if kong.request.get_method() ~= "POST" then
     return
   end
 
-  ngx.req.read_body()
-  local body = kong.request.get_raw_body()
+  -- 读取/解析请求体
+  local raw = read_raw_body()
+  kong.log.debug("请求体原文: ", raw or "nil")
+  if not raw then return end
 
-  if not body then
-    kong.log.debug("请求体未在内存中，尝试从磁盘读取")
-    local file_path = ngx.req.get_body_file()
-    if file_path then
-      local f, err = io.open(file_path, "rb")
-      if f then
-        body = f:read("*all")
-        f:close()
-        kong.log.debug("成功从磁盘读取请求体")
-      else
-        kong.log.err("打开请求体文件失败: ", err)
-      end
-    else
-      kong.log.warn("请求体既不在内存中，也没有磁盘文件")
-    end
-  end
-
-  kong.log.debug("请求体原文: ", body or "nil")
-  if not body then return end
-
-  local json, err = cjson.decode(body)
+  local json, jerr = decode(raw)
   if not json then
-    kong.log.err("JSON 解析失败: ", err)
+    kong.log.err("JSON 解析失败: ", jerr)
     return
   end
 
   local model = json.model
   kong.log.debug("请求模型名: ", model or "nil")
-  if not model then return end
-
-  local service_name = plugin_conf.service_prefix .. model
-  kong.log.debug("预期服务名: ", service_name)
-
-  local svc = service_cache[service_name]
-  if not svc then
-    kong.log.debug("未在缓存中找到匹配服务，模型: ", model)
+  if not model or model == "" then
     return
   end
 
-  kong.service.set_target(svc.host, svc.port)
-  kong.service.request.set_scheme(svc.protocol)
-
-  if svc.path then
-    kong.service.request.set_path(svc.path)
+  -- 按前缀拼接 service 名并命中缓存
+  local service_name = (conf.service_prefix or "") .. model
+  kong.log.debug("预期服务名: ", service_name)
+  local svc = service_cache[service_name]
+  if not svc then
+    kong.log.debug("服务未命中缓存: ", service_name)
+    return
   end
 
-  kong.log.debug("插件配置中 apikey 映射表: ", cjson.encode(plugin_conf.model_apikey_map or {}))
+  -- 设置上游目标
+  set_upstream_target(svc)
 
-  for _, entry in ipairs(plugin_conf.model_apikey_map or {}) do
-    kong.log.debug("遍历 apikey 映射: 模型=", entry.model, ", key=", entry.apikey)
-    if entry.model == model then
-      -- 设置 Authorization 头
-      if entry.apikey then
-        local token = "Bearer " .. entry.apikey
-        kong.service.request.set_header("Authorization", token)
-        kong.log.debug("设置 Authorization 头: ", token)
+  -- apikey 处理：优先轮询，异常随机；仅当模型匹配到条目时生效
+  if conf.model_apikey_map then
+    for _, entry in ipairs(conf.model_apikey_map) do
+      if entry.model == model then
+        -- 支持字符串（逗号/分号分隔）或数组
+        local keys = normalize_apikeys(entry.apikey)
+        local chosen
+
+        if #keys > 1 then
+          chosen = rr_pick(model, keys) or rand_pick(keys)
+          kong.log.debug("按轮询选择 apikey（模型维度）")
+        elseif #keys == 1 then
+          chosen = keys[1]
+          kong.log.debug("仅一个 apikey，直接使用")
+        else
+          kong.log.warn("未提供有效 apikey（为空或格式不正确）")
+        end
+
+        -- 设置 Authorization
+        if chosen and chosen ~= "" then
+          kong.service.request.set_header("Authorization", "Bearer " .. chosen)
+          kong.log.debug("设置 Authorization（隐藏具体值）")
+        end
+
+        -- 可选：只替换请求体中的模型名
+        if entry.newmodel and entry.newmodel ~= model then
+          kong.log.debug("替换模型名（仅请求体）: ", model, " -> ", entry.newmodel)
+          json.model = entry.newmodel
+          local new_body = encode(json)
+          if new_body then
+            kong.service.request.set_raw_body(new_body)
+            kong.log.debug("已更新请求体")
+          end
+        end
+
+        break
       end
-
-      -- 替换请求体中的模型名（仅限于请求体）
-      if entry.newmodel then
-        kong.log.debug("替换模型名（仅请求体）: ", model, " -> ", entry.newmodel)
-        json.model = entry.newmodel
-        local new_body = cjson.encode(json)
-        kong.service.request.set_raw_body(new_body)
-        kong.log.debug("已更新请求体: ", new_body)
-      end
-
-      break
     end
   end
 
-  kong.log.notice("将请求路由到服务: ", service_name, " -> ", svc.host, ":", svc.port, " (", svc.protocol, "), 路径: ", svc.path or "/")
+  kong.log.notice("路由到: ", service_name, " -> ", svc.host, ":", svc.port, " (", svc.protocol or "http", ")",
+                  " 路径=", svc.path or "/")
   ngx.ctx.buffered = false
 end
 
-
-function plugin:header_filter(plugin_conf)
+function plugin:header_filter(_)
   kong.response.set_header("X-Model-Routed", "true")
 end
 
